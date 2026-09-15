@@ -7,18 +7,23 @@ import java.util.List;
 import java.util.Set;
 import java.util.concurrent.CopyOnWriteArrayList;
 
-// DeliveryManager is the SOLE owner of this peer's local vector clock. Every
-// other class goes through here rather than touching a VectorClock directly -
-// that's what keeps the clock arithmetic correct under concurrent access,
-// since every public method here is synchronized.
-//
-// It implements two things:
-//   1. prepareForSend() - stamps outgoing messages with a clock snapshot and
-//      advances the local clock for the send event.
-//   2. onMessageReceived() - the causal delivery rule. A message is only
-//      "delivered" (merged into the clock, handed to listeners, logged as
-//      DELIVER) once it's safe to do so; otherwise it sits in a hold-back
-//      queue and is re-checked every time something new gets delivered.
+ // DeliveryManager is the SOLE owner of this peer's local vector clock. Every
+ // other class (Server, Cli, etc.) goes through here rather than touching a
+ // VectorClock directly - that's what keeps the clock arithmetic correct
+ // under concurrent access, since every public method here is synchronized.
+ //
+ // It implements two things:
+ // 1. beforeSend() / prepareForSend() - stamps outgoing messages with a
+ // clock snapshot and advances the local clock for the send event.
+ // 2. onMessageReceived() - the causal delivery rule. A message is only
+ // "delivered" (merged into the clock, handed to listeners, logged as
+ // DELIVER) once it's safe to do so; otherwise it sits in a hold-back
+ // queue and is re-checked every time something new gets delivered.
+ //
+ // HEARTBEAT messages are treated as liveness-only: their clock is merged in
+ // (so clocks still propagate even between chat messages) but they never go
+ // through the hold-back queue and never trigger a DeliveryListener callback -
+ // they aren't "content" a user needs to see delivered in order.
 public class DeliveryManager {
 
     // Something that wants to know when a CHAT/JOIN message is actually delivered, in causal order.
@@ -50,9 +55,9 @@ public class DeliveryManager {
 
     // ---------- Sending ----------
 
-    // Call this immediately before sending a CHAT or JOIN message. Advances
-    // this peer's own clock entry (a send is a local event) and returns a
-    // fully-formed Message carrying a snapshot of the clock at this moment.
+         // Call this immediately before sending a CHAT or JOIN message. Advances
+     // this peer's own clock entry (a send is a local event) and returns a
+     // fully-formed Message carrying a snapshot of the clock at this moment.
     public synchronized Message prepareForSend(MessageType type, String targetId, String body) {
         localClock.increment(selfId);
         Message message = new Message(type, selfId, targetId, body, localClock.snapshot(), System.currentTimeMillis());
@@ -60,15 +65,25 @@ public class DeliveryManager {
         return message;
     }
 
+         // Builds a HEARTBEAT message carrying a snapshot of the current clock for
+     // logging purposes only. Deliberately does NOT increment the local
+     // clock - heartbeats are a liveness signal, not a causally-ordered event.
+    public synchronized Message buildHeartbeat() {
+        return new Message(MessageType.HEARTBEAT, selfId, null, "", localClock.snapshot(), System.currentTimeMillis());
+    }
+
     // ---------- Receiving ----------
 
-    // Call this for every message that arrives over the wire, addressed to
-    // this peer. Heartbeats are merged immediately; CHAT/JOIN go through the
-    // causal delivery check and may be buffered.
+         // Call this for every message that arrives over the wire, addressed to
+     // this peer (broadcast or direct - routing is Server's job, not this
+     // class's). Heartbeats are liveness-only and are deliberately NOT merged
+     // into the clock (see buildHeartbeat() for why); CHAT/JOIN go through
+     // the causal delivery check and may be buffered.
     public synchronized void onMessageReceived(Message incoming) {
         if (incoming.getType() == MessageType.HEARTBEAT) {
-            localClock.mergeWith(VectorClock.fromSnapshot(incoming.getClock()));
-            PeerLog.log("HEARTBEAT", "<- " + incoming.getSenderId() + "  clock=" + localClock.snapshot());
+            // Intentionally not merged - see buildHeartbeat() javadoc. Liveness
+            // tracking for heartbeats happens separately, in FailureDetector.
+            PeerLog.log("HEARTBEAT", "<- " + incoming.getSenderId());
             return;
         }
 
@@ -82,10 +97,10 @@ public class DeliveryManager {
         }
     }
 
-    // The causal delivery rule. A message from senderId is deliverable here
-    // if and only if:
-    //   1. it is exactly the next message we expect from that sender, and
-    //   2. we already know everything the sender knew when they sent it.
+         // The causal delivery rule. A message from senderId is deliverable here
+     // if and only if:
+     // 1. it is exactly the next message we expect from that sender, and
+     // 2. we already know everything the sender knew when they sent it.
     private boolean isDeliverable(Message incoming) {
         String sender = incoming.getSenderId();
 
@@ -102,7 +117,7 @@ public class DeliveryManager {
             int senderKnewAbout = incoming.getClock().getOrDefault(otherPeerId, 0);
             int weKnowAbout = localClock.get(otherPeerId);
             if (senderKnewAbout > weKnowAbout) {
-                return false;
+                return false; // sender had seen something from otherPeerId that we haven't seen yet
             }
         }
 
@@ -110,8 +125,13 @@ public class DeliveryManager {
     }
 
     private void deliver(Message message) {
+        // Merge only - do NOT increment our own entry here. Our own entry
+        // must only ever advance on SEND, so that the number we stamp on our
+        // next outgoing message matches exactly what a receiver is waiting
+        // for. If delivery also incremented our own entry, a message could
+        // get stuck in another peer's hold-back queue forever, waiting for a
+        // sequence number that no outgoing message will ever carry.
         localClock.mergeWith(VectorClock.fromSnapshot(message.getClock()));
-        localClock.increment(selfId);
 
         String direction = message.isBroadcast() ? "(broadcast)" : "-> " + message.getTargetId();
         PeerLog.log("DELIVER", message.getType() + " from " + message.getSenderId() + " " + direction
@@ -135,7 +155,7 @@ public class DeliveryManager {
                     holdBackQueue.remove(candidate);
                     deliver(candidate);
                     deliveredSomething = true;
-                    break;
+                    break; // restart the scan - state changed
                 }
             }
         }
@@ -159,7 +179,7 @@ public class DeliveryManager {
                         + " (need " + otherPeerId + ":" + senderKnewAbout + ", have " + otherPeerId + ":" + weKnowAbout + ")";
             }
         }
-        return incoming.getType() + " from " + sender + " -> buffered";
+        return incoming.getType() + " from " + sender + " -> buffered"; // shouldn't normally happen
     }
 
     private void remember(String activity) {
