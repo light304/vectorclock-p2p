@@ -43,6 +43,11 @@ final class Server {
         acceptThread.start();
     }
 
+    // The actual bound port - useful when constructed with port 0 (OS-assigned), e.g. in tests.
+    int getBoundPort() {
+        return serverSocket.getLocalPort();
+    }
+
     private void acceptLoop() {
         while (running) {
             try {
