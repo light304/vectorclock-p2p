@@ -3,6 +3,7 @@ package p2p;
 import java.io.BufferedReader;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.ConcurrentLinkedQueue;
 
  // The user-facing command loop for one running peer. Also doubles as a
  // DeliveryManager.DeliveryListener and FailureDetector.SuspicionListener so
@@ -21,6 +22,14 @@ final class Cli implements DeliveryManager.DeliveryListener, FailureDetector.Sus
     private final Runnable onCrash;
     private final Runnable onQuit;
     private final BufferedReader stdin;
+
+    // Heartbeats are hidden by default - they arrive every couple of
+    // seconds from every peer and drown out everything else if shown live.
+    // While hidden, each one is buffered here instead of printed; running
+    // "heartbeat" dumps and clears the buffer on demand. "heartbeat -display"
+    // switches to printing them live as they arrive instead.
+    private final ConcurrentLinkedQueue<String> unseenHeartbeats = new ConcurrentLinkedQueue<>();
+    private volatile boolean heartbeatsLive = false;
 
     Cli(String selfId, DeliveryManager deliveryManager, FailureDetector failureDetector,
         OutboundRouter outboundRouter, BufferedReader stdin, Runnable onCrash, Runnable onQuit) {
@@ -85,6 +94,7 @@ final class Cli implements DeliveryManager.DeliveryListener, FailureDetector.Sus
             case "queue" -> handleQueue();
             case "history" -> handleHistory();
             case "delay" -> handleDelay(rest);
+            case "heartbeat" -> handleHeartbeat(rest);
             case "crash" -> handleCrash();
             case "quit", "exit" -> handleQuit();
             case "help" -> printHelp();
@@ -184,6 +194,48 @@ final class Cli implements DeliveryManager.DeliveryListener, FailureDetector.Sus
         }
     }
 
+    // Called directly by Peer.java for every incoming heartbeat, bypassing
+    // DeliveryManager entirely - heartbeats are liveness-only, not content.
+    void onHeartbeat(String senderId) {
+        String line = "<- " + senderId;
+        if (heartbeatsLive) {
+            PeerLog.log("HEARTBEAT", line);
+        } else {
+            unseenHeartbeats.add(line);
+        }
+    }
+
+    private void handleHeartbeat(String rest) {
+        if (rest.isBlank()) {
+            if (unseenHeartbeats.isEmpty()) {
+                System.out.println(heartbeatsLive
+                        ? "Heartbeats are already shown live - nothing buffered to show."
+                        : "No new heartbeats since you last checked.");
+                return;
+            }
+            System.out.println("Heartbeats received since you last checked:");
+            String line;
+            while ((line = unseenHeartbeats.poll()) != null) {
+                System.out.println("  " + line);
+            }
+            return;
+        }
+        switch (rest.trim()) {
+            case "-display" -> {
+                heartbeatsLive = true;
+                unseenHeartbeats.clear();
+                System.out.println("Heartbeats will now print live as they arrive.");
+            }
+            case "-hide" -> {
+                heartbeatsLive = false;
+                System.out.println("Heartbeats hidden again. Run 'heartbeat' to check them on demand.");
+            }
+            default -> System.out.println("Usage: heartbeat              show heartbeats received since you last checked\n"
+                    + "       heartbeat -display    show every heartbeat live as it arrives\n"
+                    + "       heartbeat -hide       go back to on-demand (hidden) mode, the default");
+        }
+    }
+
     private void handleCrash() {
         System.out.println("Simulating a crash: no goodbye message, no graceful shutdown. Exiting now.");
         onCrash.run();
@@ -209,6 +261,9 @@ final class Cli implements DeliveryManager.DeliveryListener, FailureDetector.Sus
         System.out.println("  queue                    show messages buffered pending causal delivery");
         System.out.println("  history                  show recent send/deliver activity");
         System.out.println("  delay <peerId> <secs>    artificially delay outgoing messages to one peer (0 clears)");
+        System.out.println("  heartbeat                show heartbeats received since you last checked");
+        System.out.println("  heartbeat -display       show every heartbeat live as it arrives");
+        System.out.println("  heartbeat -hide          go back to on-demand (hidden) mode, the default");
         System.out.println("  crash                    simulate this peer failing (no goodbye)");
         System.out.println("  quit / exit              shut this peer down intentionally");
         System.out.println("  help                     show this list again");
