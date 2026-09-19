@@ -71,6 +71,13 @@ public final class Peer {
         if (!message.getSenderId().equals(selfId)) { // defensive: should never happen, but never trust the wire
             failureDetector.recordSeen(message.getSenderId());
         }
+        if (message.getType() == MessageType.HEARTBEAT) {
+            // Heartbeats bypass DeliveryManager entirely - they're a liveness
+            // signal, not causally-ordered content. The CLI owns whether they
+            // get shown live or held back until the user asks for them.
+            cli.onHeartbeat(message.getSenderId());
+            return;
+        }
         deliveryManager.onMessageReceived(message);
     }
 

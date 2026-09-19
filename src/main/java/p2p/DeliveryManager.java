@@ -74,16 +74,14 @@ public class DeliveryManager {
 
     // ---------- Receiving ----------
 
-         // Call this for every message that arrives over the wire, addressed to
-     // this peer (broadcast or direct - routing is Server's job, not this
-     // class's). Heartbeats are liveness-only and are deliberately NOT merged
-     // into the clock (see buildHeartbeat() for why); CHAT/JOIN go through
-     // the causal delivery check and may be buffered.
+    // Call this for every message that arrives over the wire, addressed to
+    // this peer (broadcast or direct - routing is Server's job, not this
+    // class's). Heartbeats never reach here - Peer.java routes them straight
+    // to the CLI's heartbeat display (see Peer.handleIncoming()), since they
+    // are a liveness signal, not a causally-ordered event. The guard below
+    // is defensive only, in case that routing ever changes.
     public synchronized void onMessageReceived(Message incoming) {
         if (incoming.getType() == MessageType.HEARTBEAT) {
-            // Intentionally not merged - see buildHeartbeat() javadoc. Liveness
-            // tracking for heartbeats happens separately, in FailureDetector.
-            PeerLog.log("HEARTBEAT", "<- " + incoming.getSenderId());
             return;
         }
 

@@ -29,6 +29,10 @@ public class CliTest {
         testDeliveredChatIsPrinted();
         testDeliveredJoinIsPrinted();
         testSuspicionAndRecoveryArePrinted();
+        testHeartbeatHiddenByDefaultAndBuffered();
+        testHeartbeatDisplayModeShowsLiveAndSkipsBuffer();
+        testHeartbeatHideModeReturnsToBuffering();
+        testHeartbeatBadArgShowsUsage();
         testCrashInvokesCallbackExactlyOnce();
         testQuitInvokesCallbackExactlyOnce();
 
@@ -87,6 +91,7 @@ public class CliTest {
         check("help: mentions send", output.contains("send"));
         check("help: mentions clock", output.contains("clock"));
         check("help: mentions delay", output.contains("delay"));
+        check("help: mentions heartbeat", output.contains("heartbeat"));
         check("help: mentions crash", output.contains("crash"));
     }
 
@@ -194,6 +199,59 @@ public class CliTest {
                 () -> {}, () -> quit.set(true));
         captureOutput(() -> cli.handleCommand("quit"));
         check("quit: invokes the onQuit callback", quit.get());
+    }
+
+    private static void testHeartbeatHiddenByDefaultAndBuffered() {
+        Cli cli = buildCli("peer-A", peerIdSet("peer-A", "peer-B"), List.of(new PeerInfo("peer-B", "localhost", 1)),
+                () -> {}, () -> {});
+
+        String emptyOutput = captureOutput(() -> cli.handleCommand("heartbeat"));
+        check("heartbeat: reports nothing new when none have arrived", emptyOutput.toLowerCase().contains("no new"));
+
+        cli.onHeartbeat("peer-B");
+        cli.onHeartbeat("peer-B");
+        String output = captureOutput(() -> cli.handleCommand("heartbeat"));
+        check("heartbeat: shows buffered heartbeats on demand", output.contains("peer-B"));
+
+        String secondCheck = captureOutput(() -> cli.handleCommand("heartbeat"));
+        check("heartbeat: buffer is cleared after being shown", secondCheck.toLowerCase().contains("no new"));
+    }
+
+    private static void testHeartbeatDisplayModeShowsLiveAndSkipsBuffer() {
+        Cli cli = buildCli("peer-A", peerIdSet("peer-A", "peer-B"), List.of(new PeerInfo("peer-B", "localhost", 1)),
+                () -> {}, () -> {});
+
+        captureOutput(() -> cli.handleCommand("heartbeat -display"));
+
+        String liveOutput = captureOutput(() -> {
+            cli.onHeartbeat("peer-B");
+            PeerLog.flush();
+        });
+        check("heartbeat -display: heartbeat prints immediately once live", liveOutput.contains("peer-B"));
+
+        String checkAfter = captureOutput(() -> cli.handleCommand("heartbeat"));
+        check("heartbeat -display: nothing buffered separately while live",
+                checkAfter.toLowerCase().contains("already shown live"));
+    }
+
+    private static void testHeartbeatHideModeReturnsToBuffering() {
+        Cli cli = buildCli("peer-A", peerIdSet("peer-A", "peer-B"), List.of(new PeerInfo("peer-B", "localhost", 1)),
+                () -> {}, () -> {});
+
+        captureOutput(() -> cli.handleCommand("heartbeat -display"));
+        captureOutput(() -> cli.handleCommand("heartbeat -hide"));
+
+        cli.onHeartbeat("peer-B");
+        String output = captureOutput(() -> cli.handleCommand("heartbeat"));
+        check("heartbeat -hide: back to buffering instead of live printing", output.contains("peer-B"));
+    }
+
+    private static void testHeartbeatBadArgShowsUsage() {
+        Cli cli = buildCli("peer-A", peerIdSet("peer-A", "peer-B"), List.of(new PeerInfo("peer-B", "localhost", 1)),
+                () -> {}, () -> {});
+
+        String output = captureOutput(() -> cli.handleCommand("heartbeat -nonsense"));
+        check("heartbeat: unrecognised flag shows usage", output.toLowerCase().contains("usage"));
     }
 
     private static void check(String description, boolean condition) {
