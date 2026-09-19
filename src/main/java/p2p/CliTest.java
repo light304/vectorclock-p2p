@@ -141,7 +141,12 @@ public class CliTest {
         Message chat = new Message(MessageType.CHAT, "peer-B", null, "hello there",
                 java.util.Map.of("peer-A", 0, "peer-B", 1), System.currentTimeMillis());
 
-        String output = captureOutput(() -> cli.onDelivered(chat));
+        // onDelivered() now queues instead of printing directly (see PeerLog),
+        // so the test has to flush before the capture ends to see the line.
+        String output = captureOutput(() -> {
+            cli.onDelivered(chat);
+            PeerLog.flush();
+        });
         check("delivered chat: shows sender and body", output.contains("peer-B") && output.contains("hello there"));
     }
 
@@ -151,7 +156,10 @@ public class CliTest {
         Message join = new Message(MessageType.JOIN, "peer-B", null, "",
                 java.util.Map.of("peer-A", 0, "peer-B", 1), System.currentTimeMillis());
 
-        String output = captureOutput(() -> cli.onDelivered(join));
+        String output = captureOutput(() -> {
+            cli.onDelivered(join);
+            PeerLog.flush();
+        });
         check("delivered join: mentions the peer joined", output.contains("peer-B") && output.toLowerCase().contains("joined"));
     }
 
@@ -159,10 +167,16 @@ public class CliTest {
         Cli cli = buildCli("peer-A", peerIdSet("peer-A", "peer-B"), List.of(new PeerInfo("peer-B", "localhost", 1)),
                 () -> {}, () -> {});
 
-        String suspectOutput = captureOutput(() -> cli.onSuspected("peer-B"));
+        String suspectOutput = captureOutput(() -> {
+            cli.onSuspected("peer-B");
+            PeerLog.flush();
+        });
         check("suspicion: mentions the peer", suspectOutput.contains("peer-B"));
 
-        String recoverOutput = captureOutput(() -> cli.onRecovered("peer-B"));
+        String recoverOutput = captureOutput(() -> {
+            cli.onRecovered("peer-B");
+            PeerLog.flush();
+        });
         check("recovery: mentions the peer", recoverOutput.contains("peer-B"));
     }
 

@@ -33,17 +33,39 @@ final class Cli implements DeliveryManager.DeliveryListener, FailureDetector.Sus
         this.onQuit = onQuit;
     }
 
-    // Blocking loop: reads lines from stdin until EOF or a quit/crash command.
+         // Blocking loop: reads lines from stdin until EOF or a quit/crash
+     // command.
+     //
+     // PeerLog.flush() is called at exactly two points: right before we
+     // print the prompt and block on readLine(), and right after readLine()
+     // returns. Between those two calls, this thread is either printing our
+     // own prompt or waiting on the OS for a line of terminal input - never
+     // anything the user is watching mid-keystroke - so background log lines
+     // (heartbeats, deliveries, suspicions) can never splice themselves into
+     // text the user is currently typing. Anything queued up while they were
+     // typing simply appears as a batch the instant they press Enter,
+     // ahead of that command's own output.
     void run() {
         printWelcome();
         try {
             String line;
-            while ((line = stdin.readLine()) != null) {
+            while (true) {
+                PeerLog.flush();
+                System.out.print("> ");
+                System.out.flush();
+
+                line = stdin.readLine();
+                if (line == null) {
+                    break;
+                }
+                PeerLog.flush();
+
                 line = line.trim();
                 if (line.isEmpty()) {
                     continue;
                 }
                 handleCommand(line);
+                PeerLog.flush();
             }
         } catch (java.io.IOException e) {
             System.out.println("Input stream closed unexpectedly: " + e.getMessage());
@@ -196,11 +218,14 @@ final class Cli implements DeliveryManager.DeliveryListener, FailureDetector.Sus
 
     @Override
     public void onDelivered(Message message) {
+        // Queued, not printed directly: this callback fires from whatever
+        // thread delivered the message (usually a Server connection-handler
+        // thread), not the CLI thread - see PeerLog's javadoc for why.
         if (message.getType() == MessageType.JOIN) {
-            System.out.println(">> " + message.getSenderId() + " has joined.");
+            PeerLog.queue(">> " + message.getSenderId() + " has joined.");
         } else if (message.getType() == MessageType.CHAT) {
             String label = message.isBroadcast() ? message.getSenderId() : message.getSenderId() + " -> you (direct)";
-            System.out.println(label + ": " + message.getBody());
+            PeerLog.queue(label + ": " + message.getBody());
         }
     }
 
@@ -208,11 +233,13 @@ final class Cli implements DeliveryManager.DeliveryListener, FailureDetector.Sus
 
     @Override
     public void onSuspected(String peerId) {
-        System.out.println(">> " + peerId + " appears to be unreachable (no contact recently).");
+        // Queued: fires from FailureDetector's own timer thread.
+        PeerLog.queue(">> " + peerId + " appears to be unreachable (no contact recently).");
     }
 
     @Override
     public void onRecovered(String peerId) {
-        System.out.println(">> " + peerId + " is responding again.");
+        // Queued: fires from FailureDetector's own timer thread.
+        PeerLog.queue(">> " + peerId + " is responding again.");
     }
 }
