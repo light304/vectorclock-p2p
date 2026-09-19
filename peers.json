@@ -1,0 +1,5 @@
+[
+  { "id": "peer-A", "host": "localhost", "port": 5001 },
+  { "id": "peer-B", "host": "localhost", "port": 5002 },
+  { "id": "peer-C", "host": "localhost", "port": 5003 }
+]
