@@ -79,6 +79,11 @@ public final class Peer {
             return;
         }
         deliveryManager.onMessageReceived(message);
+        if (message.getType() == MessageType.JOIN && !message.getSenderId().equals(selfId)) {
+            // Someone just (re)started: give them our clock and our channel
+            // bookkeeping for our channel with them so they can catch up.
+            outboundRouter.sendSync(message.getSenderId());
+        }
     }
 
     private void start() throws IOException {

@@ -17,13 +17,12 @@ import java.util.Set;
  // messages actually addressed to it - a direct message to someone else
  // entirely can no longer block delivery on an unrelated channel.
  
- // Not covered here: crash-and-restart recovery. That depends on some
- // mechanism carrying each channel's counters across a restart (e.g. a
- // future SYNC message) so a rejoining peer's channels resume where they
- // left off; no such mechanism exists in this codebase yet, so a restarted
- // peer's channel counters simply reset to zero today, same as before this
- // change - not worse, but not fixed either. That's a separate piece of
- // work from the per-channel refactor tested here.
+ // Also covers the reconnect handshake (JOIN / SYNC, see
+ // DeliveryManager.buildControl() / adoptClock()): a rejoining peer's clock
+ // and per-channel counters reset to zero on restart, and SYNC replies from
+ // still-running peers are what let it resume exactly where it left off on
+ // every channel, instead of either wedging forever or restarting numbering
+ // from 1 and looking like a stream of stale duplicates to everyone else.
  
  public class DeliveryManagerTest {
 
@@ -41,6 +40,10 @@ import java.util.Set;
         testTwoDirectMessagesArriveSwapped();
         testDirectMessageAfterBroadcastOvertakesThatBroadcast();
         testLostDirectMessageLeavesReceiverWaitingForever();
+        testJoinAndSyncDoNotTickClockOrConsumeChannelSeq();
+        testRestartedPeerResumesChannelNumberingAfterSync();
+        testCatchUpDiscardsQueuedMessageCoveredByChannelRestore();
+        testAdoptingAStaleSyncNeverMovesChannelCountersBackward();
 
         System.out.println();
         System.out.println("---------------------------------------------");
@@ -301,6 +304,122 @@ import java.util.Set;
                 b.currentHoldBackQueueSnapshot().size() == 1);
         check("lost direct: nothing delivered while waiting on the lost message",
                 deliveredAtB.isEmpty());
+    }
+
+    // ---------------- reconnect: JOIN / SYNC catch-up ----------------
+
+    private static void testJoinAndSyncDoNotTickClockOrConsumeChannelSeq() {
+        Set<String> allPeers = peers("peer-A", "peer-B");
+        DeliveryManager a = new DeliveryManager("peer-A", allPeers);
+        DeliveryManager b = new DeliveryManager("peer-B", allPeers);
+
+        Message join = b.buildControl(MessageType.JOIN, null);
+        check("join: building it does not tick the sender's own clock",
+                b.currentClockSnapshot().get("peer-B") == 0);
+
+        List<Message> notified = new ArrayList<>();
+        a.addListener(notified::add);
+        a.onMessageReceived(join);
+
+        check("join: never enters the hold-back queue", a.currentHoldBackQueueSnapshot().isEmpty());
+        check("join: listeners are told about it immediately", notified.size() == 1);
+        check("join: receiver's clock is untouched (joiner's clock is stale, so it is not merged)",
+                a.currentClockSnapshot().get("peer-B") == 0);
+    }
+
+    // The exact reconnect scenario: B sends a couple of broadcasts, crashes,
+    // and restarts with a brand-new (all-zero) DeliveryManager. Without the
+    // JOIN/SYNC handshake, the B->A and B->C channels would restart
+    // numbering from 1 and look like stale duplicates, while the A->B and
+    // C->B channels would still expect B to be picking up from wherever it
+    // left off and could stay buffered forever.
+    private static void testRestartedPeerResumesChannelNumberingAfterSync() {
+        Set<String> allPeers = peers("peer-A", "peer-B", "peer-C");
+        DeliveryManager a = new DeliveryManager("peer-A", allPeers);
+        DeliveryManager b = new DeliveryManager("peer-B", allPeers);
+        DeliveryManager c = new DeliveryManager("peer-C", allPeers);
+
+        // Normal life before the crash: B broadcasts twice, A broadcasts once.
+        for (String body : new String[] {"b one", "b two"}) {
+            List<Message> copies = b.prepareForBroadcast(MessageType.CHAT, body, List.of("peer-A", "peer-C"));
+            a.onMessageReceived(copies.get(0));
+            c.onMessageReceived(copies.get(1));
+        }
+        List<Message> aCopies = a.prepareForBroadcast(MessageType.CHAT, "a one", List.of("peer-B", "peer-C"));
+        b.onMessageReceived(aCopies.get(0));
+        c.onMessageReceived(aCopies.get(1));
+
+        // B crashes: a fresh DeliveryManager, clock and channel counters all zero.
+        DeliveryManager reborn = new DeliveryManager("peer-B", allPeers);
+        check("restart: a fresh peer really does start at zero", reborn.currentClockSnapshot().get("peer-B") == 0);
+
+        // B announces itself; A and C answer with a SYNC; B adopts both.
+        Message join = reborn.buildControl(MessageType.JOIN, null);
+        a.onMessageReceived(join);
+        c.onMessageReceived(join);
+        reborn.onMessageReceived(a.buildControl(MessageType.SYNC, "peer-B"));
+        reborn.onMessageReceived(c.buildControl(MessageType.SYNC, "peer-B"));
+
+        check("catch-up: own clock entry restored to the highest value anyone saw from it",
+                reborn.currentClockSnapshot().get("peer-B") == 2);
+
+        // The reborn peer's next message to A must resume at channelSeq 3
+        // (A already delivered B's first two) and deliver immediately.
+        Message next = reborn.prepareForSend(MessageType.CHAT, "peer-A", "b three");
+        check("catch-up: outgoing channel to A resumes at 3, not 1", next.getChannelSeq() == 3);
+        a.onMessageReceived(next);
+        check("catch-up: A delivers it immediately (channel counters agree)",
+                a.currentHoldBackQueueSnapshot().isEmpty());
+
+        // And the reverse direction: A's next message reaches the reborn
+        // peer without getting stuck waiting on the pre-crash sequence.
+        Message a2 = a.prepareForSend(MessageType.CHAT, "peer-B", "a two");
+        reborn.onMessageReceived(a2);
+        check("catch-up: reborn peer delivers new messages from A immediately (not waiting on the old channel position)",
+                reborn.currentHoldBackQueueSnapshot().isEmpty());
+    }
+
+    // A message already sitting in the hold-back queue can be made
+    // permanently un-deliverable by a SYNC (its channel position is now in
+    // the past). It must be discarded, not left in the queue forever - this
+    // is the documented "catching up means skipping history" trade-off.
+    private static void testCatchUpDiscardsQueuedMessageCoveredByChannelRestore() {
+        Set<String> allPeers = peers("peer-A", "peer-B");
+        DeliveryManager a = new DeliveryManager("peer-A", allPeers);
+        DeliveryManager b = new DeliveryManager("peer-B", allPeers);
+
+        a.prepareForSend(MessageType.CHAT, "peer-B", "missed");        // channelSeq 1, never reaches B
+        Message second = a.prepareForSend(MessageType.CHAT, "peer-B", "arrives alone"); // channelSeq 2
+        b.onMessageReceived(second);
+        check("discard: message with a gap ahead of it is buffered first",
+                b.currentHoldBackQueueSnapshot().size() == 1);
+
+        b.onMessageReceived(a.buildControl(MessageType.SYNC, "peer-B")); // A reports its channel to B is at 2
+        check("discard: the now-unreachable buffered message is removed from the queue",
+                b.currentHoldBackQueueSnapshot().isEmpty());
+
+        Message third = a.prepareForSend(MessageType.CHAT, "peer-B", "three");
+        check("discard: channel position is restored - the next real message (3) delivers immediately",
+                third.getChannelSeq() == 3);
+        b.onMessageReceived(third);
+        check("discard: ...and it actually does deliver, not buffer again",
+                b.currentHoldBackQueueSnapshot().isEmpty());
+    }
+
+    private static void testAdoptingAStaleSyncNeverMovesChannelCountersBackward() {
+        Set<String> allPeers = peers("peer-A", "peer-B");
+        DeliveryManager a = new DeliveryManager("peer-A", allPeers);
+        DeliveryManager b = new DeliveryManager("peer-B", allPeers);
+
+        b.prepareForSend(MessageType.CHAT, "peer-A", "x");
+        b.prepareForSend(MessageType.CHAT, "peer-A", "y"); // B's outgoing channel to A is now at 2
+
+        // A stale/duplicate SYNC from a peer that has seen nothing yet.
+        b.onMessageReceived(a.buildControl(MessageType.SYNC, "peer-B"));
+
+        Message next = b.prepareForSend(MessageType.CHAT, "peer-A", "z");
+        check("monotonic: a behind-the-times sync never rewinds our outgoing channel counter",
+                next.getChannelSeq() == 3);
     }
 
     private static void check(String description, boolean condition) {

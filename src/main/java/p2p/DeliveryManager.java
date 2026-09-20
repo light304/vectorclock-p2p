@@ -39,6 +39,7 @@ import java.util.concurrent.CopyOnWriteArrayList;
 // meaningful channelSeq, are never checked against it, and never go through
 // the hold-back queue or trigger a DeliveryListener callback - they aren't
 // "content" a user needs to see delivered in order.
+
 public class DeliveryManager {
 
     // Something that wants to know when a CHAT/JOIN message is actually delivered, in causal order.
@@ -127,16 +128,43 @@ public class DeliveryManager {
         return new Message(MessageType.HEARTBEAT, selfId, null, "", localClock.snapshot(), System.currentTimeMillis());
     }
 
-    // ---------- Receiving ----------
+    // Builds a JOIN or SYNC control message. Like a heartbeat, neither ticks
+    // the local clock nor consumes a channel sequence number - control
+    // messages sit outside the per-channel sequence entirely, so a JOIN from
+    // a freshly-restarted peer (whose channel counters reset to zero) can
+    // never leave a gap that wedges anyone's hold-back queue.
+    //
+    // A SYNC's body carries "outToTarget:inFromTarget" - this peer's own
+    // channel bookkeeping for its channel with targetId:
+    //   outToTarget  = last seq WE have stamped on the selfId -> targetId channel
+    //   inFromTarget = last seq WE have actually delivered on the targetId -> selfId channel
+    // The rejoining peer on the other end uses these to resume both of its
+    // channel counters with us right where they left off - see adoptClock().
+    public synchronized Message buildControl(MessageType type, String targetId) {
+        if (type != MessageType.JOIN && type != MessageType.SYNC) {
+            throw new IllegalArgumentException("buildControl only builds JOIN or SYNC, not " + type);
+        }
+        String body = "";
+        if (type == MessageType.SYNC) {
+            int outToTarget = outgoingChannelSeq.getOrDefault(targetId, 0);
+            int inFromTarget = incomingChannelSeq.getOrDefault(targetId, 0);
+            body = outToTarget + ":" + inFromTarget;
+        }
+        Message message = new Message(type, selfId, targetId, body, localClock.snapshot(), System.currentTimeMillis());
+        remember("SEND " + type + (targetId == null ? " (broadcast)" : " -> " + targetId));
+        return message;
+    }
 
-    // Call this for every message that arrives over the wire, addressed to
-    // this peer (broadcast or direct - routing is Server's job, not this
-    // class's). Heartbeats never reach here - Peer.java routes them straight
-    // to the CLI's heartbeat display (see Peer.handleIncoming()), since they
-    // are a liveness signal, not a causally-ordered event. The guard below
-    // is defensive only, in case that routing ever changes.
     public synchronized void onMessageReceived(Message incoming) {
         if (incoming.getType() == MessageType.HEARTBEAT) {
+            return;
+        }
+        if (incoming.getType() == MessageType.JOIN) {
+            handleJoin(incoming);
+            return;
+        }
+        if (incoming.getType() == MessageType.SYNC) {
+            adoptClock(incoming);
             return;
         }
 
@@ -148,6 +176,65 @@ public class DeliveryManager {
             PeerLog.log("BUFFER", describeWhyBuffered(incoming));
             remember("BUFFER " + incoming.getType() + " from " + incoming.getSenderId());
         }
+    }
+
+    private void handleJoin(Message join) {
+        PeerLog.log("DELIVER", "JOIN from " + join.getSenderId() + " (broadcast)");
+        remember("DELIVER JOIN from " + join.getSenderId());
+        for (DeliveryListener listener : listeners) {
+            listener.onDelivered(join);
+        }
+    }
+
+    public synchronized void adoptClock(Message sync) {
+        String fromPeerId = sync.getSenderId();
+
+        Map<String, Integer> before = localClock.snapshot();
+        localClock.mergeWith(VectorClock.fromSnapshot(sync.getClock()));
+        Map<String, Integer> after = localClock.snapshot();
+
+        restoreChannelPositions(fromPeerId, sync.getBody());
+
+        if (before.equals(after)) {
+            PeerLog.log("CATCHUP", "clock from " + fromPeerId + " - already up to date  clock=" + after);
+        } else {
+            PeerLog.log("CATCHUP", "synced with " + fromPeerId + "  " + before + " -> " + after);
+        }
+        remember("CATCHUP from " + fromPeerId);
+
+        int dropped = discardCoveredMessages(fromPeerId);
+        if (dropped > 0) {
+            PeerLog.log("CATCHUP", "discarded " + dropped + " buffered message(s) already covered by the sync");
+        }
+        drainHoldBackQueue();
+    }
+
+    private void restoreChannelPositions(String fromPeerId, String body) {
+        String[] parts = body.split(":");
+        if (parts.length != 2) {
+            return; // not a SYNC body (e.g. empty, from a JOIN) - nothing to restore
+        }
+        try {
+            int theirOutToUs = Integer.parseInt(parts[0]);
+            int theirInFromUs = Integer.parseInt(parts[1]);
+            incomingChannelSeq.merge(fromPeerId, theirOutToUs, Math::max);
+            outgoingChannelSeq.merge(fromPeerId, theirInFromUs, Math::max);
+        } catch (NumberFormatException ignored) {
+            // malformed - ignore rather than crash the peer over a bad SYNC
+        }
+    }
+
+    private int discardCoveredMessages(String fromPeerId) {
+        int removed = 0;
+        int haveSeq = incomingChannelSeq.getOrDefault(fromPeerId, 0);
+        for (Message queued : new ArrayList<>(holdBackQueue)) {
+            if (queued.getSenderId().equals(fromPeerId) && queued.getChannelSeq() <= haveSeq) {
+                holdBackQueue.remove(queued);
+                remember("DISCARD " + queued.getType() + " from " + fromPeerId + " (covered by catch-up)");
+                removed++;
+            }
+        }
+        return removed;
     }
 
     // The causal delivery rule. A message from senderId is deliverable here

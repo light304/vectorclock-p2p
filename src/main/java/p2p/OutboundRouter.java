@@ -45,7 +45,6 @@ final class OutboundRouter {
         });
     }
 
-    // ---------- Delay configuration (demo feature for causal-ordering scenarios) ----------
 
     // Sets an artificial delay (seconds) applied to every future send targeting this peer. 0 clears it.
     void setDelay(String peerId, int seconds) {
@@ -92,17 +91,28 @@ final class OutboundRouter {
         sendWithConfiguredDelay(otherPeersById.get(targetId), message);
     }
 
-    // Broadcasts a JOIN announcement to every other configured peer. Called once at startup.
-    void announceJoin() {
-        broadcastToAll(MessageType.JOIN, "");
-    }
-
     private void broadcastToAll(MessageType type, String body) {
         List<String> receiverIds = new ArrayList<>(otherPeersById.keySet());
         List<Message> copies = deliveryManager.prepareForBroadcast(type, body, receiverIds);
         for (int i = 0; i < receiverIds.size(); i++) {
             sendWithConfiguredDelay(otherPeersById.get(receiverIds.get(i)), copies.get(i));
         }
+    }
+
+    void announceJoin() {
+        Message join = deliveryManager.buildControl(MessageType.JOIN, null);
+        for (PeerInfo target : otherPeersById.values()) {
+            sendWithConfiguredDelay(target, join);
+        }
+    }
+
+    void sendSync(String targetId) {
+        PeerInfo target = otherPeersById.get(targetId);
+        if (target == null) {
+            return;
+        }
+        Message sync = deliveryManager.buildControl(MessageType.SYNC, targetId);
+        sendWithConfiguredDelay(target, sync);
     }
 
     // Broadcasts a heartbeat to every other peer. Heartbeats bypass the
