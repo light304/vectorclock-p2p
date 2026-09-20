@@ -11,18 +11,22 @@ import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 import java.util.stream.Collectors;
 
- // Everything about SENDING messages to other peers lives here, so Cli and
- // Peer don't need to know about sockets, delays, or DeliveryManager's
- // send-side API directly.
- //
- // A broadcast calls DeliveryManager.prepareForSend() exactly ONCE (one
- // causal send event, one clock snapshot), then transmits that same Message
- // object to every other peer - it is one logical event fanned out to many
- // recipients, not many separate events.
- //
- // All actual socket I/O happens on a background executor so the CLI thread
- // never blocks waiting for a slow or dead peer's connection attempt to
- // time out.
+// Everything about SENDING messages to other peers lives here, so Cli and
+// Peer don't need to know about sockets, delays, or DeliveryManager's
+// send-side API directly.
+
+// A broadcast calls DeliveryManager.prepareForBroadcast() exactly ONCE (one
+// causal send event, one clock snapshot), which hands back a separate
+// per-recipient Message for each target - each copy carries the same clock
+// snapshot but its own sequence number on that recipient's channel (see
+// DeliveryManager). It is one logical event fanned out to many recipients,
+// not many separate events, even though each recipient now gets a distinct
+// Message object.
+
+// All actual socket I/O happens on a background executor so the CLI thread
+// never blocks waiting for a slow or dead peer's connection attempt to
+// time out.
+
 final class OutboundRouter {
 
     private final DeliveryManager deliveryManager;
@@ -41,7 +45,6 @@ final class OutboundRouter {
         });
     }
 
-    // ---------- Delay configuration (demo feature for causal-ordering scenarios) ----------
 
     // Sets an artificial delay (seconds) applied to every future send targeting this peer. 0 clears it.
     void setDelay(String peerId, int seconds) {
@@ -74,12 +77,11 @@ final class OutboundRouter {
 
     // ---------- Sending ----------
 
-    // Broadcasts a CHAT message to every other configured peer.
+    // Broadcasts a CHAT message to every other configured peer. Each
+    // recipient gets its own copy of the Message, stamped with its own
+    // channel sequence number - see DeliveryManager.prepareForBroadcast().
     void broadcastChat(String body) {
-        Message message = deliveryManager.prepareForSend(MessageType.CHAT, null, body);
-        for (PeerInfo target : otherPeersById.values()) {
-            sendWithConfiguredDelay(target, message);
-        }
+        broadcastToAll(MessageType.CHAT, body);
     }
 
     // Sends a CHAT message to exactly one named peer.
@@ -89,20 +91,36 @@ final class OutboundRouter {
         sendWithConfiguredDelay(otherPeersById.get(targetId), message);
     }
 
-    // Broadcasts a JOIN announcement to every other configured peer. Called once at startup.
-    void announceJoin() {
-        Message message = deliveryManager.prepareForSend(MessageType.JOIN, null, "");
-        for (PeerInfo target : otherPeersById.values()) {
-            sendWithConfiguredDelay(target, message);
+    private void broadcastToAll(MessageType type, String body) {
+        List<String> receiverIds = new ArrayList<>(otherPeersById.keySet());
+        List<Message> copies = deliveryManager.prepareForBroadcast(type, body, receiverIds);
+        for (int i = 0; i < receiverIds.size(); i++) {
+            sendWithConfiguredDelay(otherPeersById.get(receiverIds.get(i)), copies.get(i));
         }
     }
 
-         // Broadcasts a heartbeat to every other peer. Heartbeats bypass the
-     // artificial delay setting (delay is for demonstrating causal ordering
-     // of CHAT/JOIN content, not for testing failure detection) and failures
-     // are logged only at a glance, not per-peer per-tick, since the
-     // receiving side's FailureDetector is the real source of truth for
-     // "is this peer still there".
+    void announceJoin() {
+        Message join = deliveryManager.buildControl(MessageType.JOIN, null);
+        for (PeerInfo target : otherPeersById.values()) {
+            sendWithConfiguredDelay(target, join);
+        }
+    }
+
+    void sendSync(String targetId) {
+        PeerInfo target = otherPeersById.get(targetId);
+        if (target == null) {
+            return;
+        }
+        Message sync = deliveryManager.buildControl(MessageType.SYNC, targetId);
+        sendWithConfiguredDelay(target, sync);
+    }
+
+    // Broadcasts a heartbeat to every other peer. Heartbeats bypass the
+    // artificial delay setting (delay is for demonstrating causal ordering
+    // of CHAT/JOIN content, not for testing failure detection) and failures
+    // are logged only at a glance, not per-peer per-tick, since the
+    // receiving side's FailureDetector is the real source of truth for
+    // "is this peer still there".
     void broadcastHeartbeat() {
         Message heartbeat = deliveryManager.buildHeartbeat();
         for (PeerInfo target : otherPeersById.values()) {

@@ -13,8 +13,16 @@ import java.util.Objects;
  // targetId      - null for a broadcast, or a specific peer ID for a direct message
  // body          - free-text payload (chat content; empty for JOIN/HEARTBEAT)
  // clock         - a snapshot of the sender's vector clock at send time
+ // channelSeq    - this message's sequence number on the senderId -> receiver
+ //                 channel (see DeliveryManager). A broadcast is one causal
+ //                 send event but fans out into one Message PER RECIPIENT,
+ //                 each carrying its own channelSeq for that recipient's
+ //                 channel - that's what lets a receiver's FIFO check ignore
+ //                 messages the sender addressed to someone else entirely.
+ //                 Meaningless for HEARTBEAT (never checked - see
+ //                 DeliveryManager.onMessageReceived).
  // sentAtMillis  - wall-clock send time, for human-readable logging only
- // (NOT used for ordering - that is what the vector clock is for)
+ // (NOT used for ordering - that is what the vector clock + channelSeq are for)
 public final class Message {
 
     private final MessageType type;
@@ -22,16 +30,28 @@ public final class Message {
     private final String targetId; // nullable: null means broadcast
     private final String body;
     private final Map<String, Integer> clock;
+    private final int channelSeq;
     private final long sentAtMillis;
 
     public Message(MessageType type, String senderId, String targetId, String body,
-                   Map<String, Integer> clock, long sentAtMillis) {
+                   Map<String, Integer> clock, int channelSeq, long sentAtMillis) {
         this.type = Objects.requireNonNull(type, "type");
         this.senderId = Objects.requireNonNull(senderId, "senderId");
         this.targetId = targetId; // intentionally nullable
         this.body = body == null ? "" : body;
         this.clock = Collections.unmodifiableMap(clock);
+        this.channelSeq = channelSeq;
         this.sentAtMillis = sentAtMillis;
+    }
+
+    // Legacy constructor, kept so code that doesn't care about per-channel
+    // sequencing (JSON round-trip tests, the real-TCP smoke test, HEARTBEAT
+    // construction) doesn't need to invent a channelSeq value. Stamps 0,
+    // which is never a valid sequence number (channels start at 1), so it
+    // reads clearly as "not meaningfully sequenced" wherever it shows up.
+    public Message(MessageType type, String senderId, String targetId, String body,
+                   Map<String, Integer> clock, long sentAtMillis) {
+        this(type, senderId, targetId, body, clock, 0, sentAtMillis);
     }
 
     public MessageType getType() {
@@ -63,6 +83,11 @@ public final class Message {
         return clock;
     }
 
+    // This message's sequence number on the senderId -> receiver channel. See the class javadoc.
+    public int getChannelSeq() {
+        return channelSeq;
+    }
+
     public long getSentAtMillis() {
         return sentAtMillis;
     }
@@ -76,6 +101,7 @@ public final class Message {
         json.append("\"targetId\":").append(targetId == null ? "null" : JsonUtil.writeString(targetId)).append(',');
         json.append("\"body\":").append(JsonUtil.writeString(body)).append(',');
         json.append("\"clock\":").append(JsonUtil.writeIntMap(clock)).append(',');
+        json.append("\"channelSeq\":").append(channelSeq).append(',');
         json.append("\"sentAtMillis\":").append(sentAtMillis);
         json.append('}');
         return json.toString();
@@ -104,6 +130,13 @@ public final class Message {
         }
         Map<String, Integer> clock = (Map<String, Integer>) clockField;
 
+        int channelSeq;
+        try {
+            channelSeq = Integer.parseInt((String) requireField(fields, "channelSeq"));
+        } catch (NumberFormatException e) {
+            throw new JsonUtil.JsonParseException("Invalid channelSeq value");
+        }
+
         long sentAtMillis;
         try {
             sentAtMillis = Long.parseLong((String) requireField(fields, "sentAtMillis"));
@@ -111,7 +144,7 @@ public final class Message {
             throw new JsonUtil.JsonParseException("Invalid sentAtMillis value");
         }
 
-        return new Message(type, senderId, targetId, body, clock, sentAtMillis);
+        return new Message(type, senderId, targetId, body, clock, channelSeq, sentAtMillis);
     }
 
     private static Object requireField(Map<String, Object> fields, String key) {
